@@ -1,0 +1,124 @@
+PowerShell Script to Disable Windows Search Service and decrease CPU usage on devices. 
+This Script both reduces the backbround CPU and disk usage on a device; increasing preformance while additionally enhancing data privacy by preventing a windows system 
+from duplicating file metatadata and content into indexed databases. 
+
+This Powershell script has been tested on a Windows 11 device Q1 of 2026 and worked: 
+
+<# 
+.SYNOPSIS
+Silently disables Windows Search (WSearch) 
+
+.DESCRIPTION
+- Stops the Windows Search service if running
+- Sets startup type to Disabled
+- Verifies state
+- Silent by default (no stdout/stderr noise unless a hard failure bubbles up)
+- Optional file logging via -EnableFileLog
+
+.EXITCODES
+0 = Success (already disabled or successfully disabled)
+1 = Failure to apply desired state
+2 = Service not found
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$EnableFileLog,
+    [string]$LogPath = "$env:ProgramData\NinjaOne\Logs\Disable-WindowsSearch.log"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+$DebugPreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
+    )
+
+    if (-not $EnableFileLog) { return }
+
+    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $line = "$ts [$Level] $Message"
+
+    try {
+        $dir = Split-Path -Path $LogPath -Parent
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        Add-Content -Path $LogPath -Value $line -Encoding UTF8
+    } catch {
+        # logging must never break remediation
+    }
+}
+
+function Get-ServiceStartupType {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $svcRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+    if (-not (Test-Path $svcRegPath)) { return $null }
+
+    # Start values: 2=Automatic, 3=Manual, 4=Disabled
+    $startValue = (Get-ItemProperty -Path $svcRegPath -Name Start -ErrorAction Stop).Start
+    switch ($startValue) {
+        2 { 'Automatic' }
+        3 { 'Manual' }
+        4 { 'Disabled' }
+        default { "Unknown($startValue)" }
+    }
+}
+
+try {
+    $serviceName = 'WSearch'
+
+    Write-Log "Starting remediation: Disable $serviceName."
+
+    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Log "Service '$serviceName' not found." "WARN"
+        exit 2
+    }
+
+    $initialStatus = $svc.Status
+    $initialStartup = Get-ServiceStartupType -Name $serviceName
+    Write-Log "Initial: Status=$initialStatus, StartupType=$initialStartup"
+
+    # Stop it if needed
+    if ($svc.Status -ne 'Stopped') {
+        Write-Log "Stopping '$serviceName'..."
+        try {
+            Stop-Service -Name $serviceName -Force -ErrorAction Stop
+        } catch {
+            Start-Sleep -Seconds 2
+            Stop-Service -Name $serviceName -Force -ErrorAction Stop
+        }
+    } else {
+        Write-Log "'$serviceName' already stopped."
+    }
+
+    # Disable startup
+    Write-Log "Disabling '$serviceName' startup type..."
+    Set-Service -Name $serviceName -StartupType Disabled -ErrorAction Stop
+
+    # Verify
+    Start-Sleep -Seconds 1
+    $svc = Get-Service -Name $serviceName -ErrorAction Stop
+    $finalStartup = Get-ServiceStartupType -Name $serviceName
+    Write-Log "Final: Status=$($svc.Status), StartupType=$finalStartup"
+
+    if ($svc.Status -eq 'Stopped' -and $finalStartup -eq 'Disabled') {
+        Write-Log "SUCCESS: '$serviceName' is stopped and disabled."
+        exit 0
+    } else {
+        Write-Log "FAILURE: Desired state not achieved." "ERROR"
+        exit 1
+    }
+}
+catch {
+    # Still silent to console; only file log if enabled
+    Write-Log ("Unhandled error: " + $_.Exception.Message) "ERROR"
+    exit 1
+}
