@@ -1,0 +1,186 @@
+Remediation of CVE-2013-3900. This attack is still active and relevant as per Microsofts last update in December 2024 "Microsoft does not plan to enforce the stricter verification behavior as a default functionality on supported releases of Microsoft Windows."
+Description of Vulnerability: An anonymous attacker could exploit the vulnerability by modifying an existing signed executable file to leverage unverified portions of the file in such a way as to add malicious code to the file without invalidating the signature. An attacker who successfully exploited this vulnerability could take complete control of an affected system. An attacker could then install programs; view, change, or delete data; or create new accounts with full user rights.
+
+
+This Powershell Remediation has been tested as of Q1 2026 and works as of time tested.
+Powershell script as follows: 
+
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Enables Certificate Padding Check (EnableCertPaddingCheck) on Windows devices.
+
+.DESCRIPTION
+    Remediates CVE-2013-3900 — WinVerifyTrust Signature Validation Vulnerability.
+    This vulnerability allows attackers to embed malicious code into the padding
+    space of a legitimately signed PE file (.exe, .dll, .sys) without invalidating
+    the Authenticode digital signature. Enabling this check forces Windows to reject
+    such non-conforming binaries as unsigned.
+
+    What this script does:
+      - Sets EnableCertPaddingCheck = 1 (REG_DWORD) in both required registry paths:
+          64-bit : HKLM\SOFTWARE\Microsoft\Cryptography\Wintrust\Config
+          WOW64  : HKLM\SOFTWARE\Wow6432Node\Microsoft\Cryptography\Wintrust\Config
+      - Creates the registry key path if it does not exist
+      - Skips keys already correctly configured
+      - Verifies both values after writing
+      - No reboot required — change takes effect immediately
+
+    Value type: REG_DWORD per Microsoft's latest guidance (updated November 2024).
+    Note: REG_SZ "1" is also accepted by Windows and does NOT need to be changed
+    if already present — per Microsoft's official statement.
+
+    References:
+      CVE        : https://msrc.microsoft.com/update-guide/vulnerability/CVE-2013-3900
+      Advisory   : https://learn.microsoft.com/en-us/security-updates/securityadvisories/2014/2915720
+      CIS Control: CIS Windows Benchmark — MS Security Guide ADMX
+
+    Exit codes (NinjaOne policy evaluation):
+      0 = Already compliant, or successfully remediated
+      1 = Failed to set one or both registry values
+
+.NOTES
+    CVE         : CVE-2013-3900
+    CVSS Score  : 7.4 (High)
+    No Reboot   : True
+    Run As      : System
+    PowerShell  : 5.1+
+    Safe to re-run : Yes (idempotent)
+#>
+
+# ── Registry Paths ─────────────────────────────────────────────────────────────
+$RegKeys = @(
+    @{
+        Path        = "HKLM:\SOFTWARE\Microsoft\Cryptography\Wintrust\Config"
+        Description = "64-bit (native)"
+    },
+    @{
+        Path        = "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Cryptography\Wintrust\Config"
+        Description = "32-bit WOW64 compatibility"
+    }
+)
+
+$ValueName = "EnableCertPaddingCheck"
+$ValueData = 1
+$ValueType = "DWORD"   # REG_DWORD — Microsoft's preferred type as of Nov 2024
+
+# ── Helper: Logging ────────────────────────────────────────────────────────────
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Output "[$ts] [$Level] $Message"
+}
+
+# ── Helper: Check if a value is already correctly configured ───────────────────
+function Test-RegValue {
+    param([string]$Path, [string]$Name, [int]$ExpectedData)
+    try {
+        $current = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+        $raw = $current.$Name
+        # Accept both DWORD 1 and REG_SZ "1" as compliant per Microsoft guidance
+        return ($raw -eq $ExpectedData -or $raw -eq "$ExpectedData")
+    } catch {
+        return $false
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "================================================"
+Write-Log "CVE-2013-3900 — Certificate Padding Check"
+Write-Log "EnableCertPaddingCheck Remediation Script"
+Write-Log "================================================"
+Write-Log "Setting: $ValueName = $ValueData ($ValueType)"
+Write-Log "Scope  : 64-bit + WOW64 registry hives"
+Write-Log "------------------------------------------------"
+
+$allSucceeded = $true
+$changesNeeded = 0
+$changesApplied = 0
+
+foreach ($key in $RegKeys) {
+    $path = $key.Path
+    $desc = $key.Description
+
+    Write-Log "Processing [$desc]"
+    Write-Log "  Path: $path"
+
+    # ── Check current state ───────────────────────────────────────────────────
+    $alreadyCompliant = Test-RegValue -Path $path -Name $ValueName -ExpectedData $ValueData
+
+    if ($alreadyCompliant) {
+        Write-Log "  [COMPLIANT] $ValueName is already correctly set. No change needed." "INFO"
+        continue
+    }
+
+    $changesNeeded++
+    Write-Log "  [ACTION] Value missing or incorrect. Applying remediation..." "WARN"
+
+    # ── Ensure registry key path exists ──────────────────────────────────────
+    if (-not (Test-Path $path)) {
+        Write-Log "  Registry key path does not exist. Creating..."
+        try {
+            New-Item -Path $path -Force -ErrorAction Stop | Out-Null
+            Write-Log "  Registry key created."
+        } catch {
+            Write-Log "  FAILED to create registry key: $_" "ERROR"
+            $allSucceeded = $false
+            continue
+        }
+    }
+
+    # ── Set the value ─────────────────────────────────────────────────────────
+    try {
+        # Use -Force to overwrite if a REG_SZ "1" was previously set by older guidance
+        New-ItemProperty -Path $path `
+                         -Name $ValueName `
+                         -Value $ValueData `
+                         -PropertyType $ValueType `
+                         -Force `
+                         -ErrorAction Stop | Out-Null
+        Write-Log "  Value written successfully."
+    } catch {
+        Write-Log "  FAILED to write registry value: $_" "ERROR"
+        $allSucceeded = $false
+        continue
+    }
+
+    # ── Verify the write ──────────────────────────────────────────────────────
+    $verified = Test-RegValue -Path $path -Name $ValueName -ExpectedData $ValueData
+    if ($verified) {
+        Write-Log "  [VERIFIED] $ValueName = $ValueData confirmed in registry."
+        $changesApplied++
+    } else {
+        Write-Log "  [FAILED] Value written but verification failed. Manual inspection required." "ERROR"
+        $allSucceeded = $false
+    }
+
+    Write-Log "  --------"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RESULT SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "================================================"
+
+if ($allSucceeded) {
+    if ($changesNeeded -eq 0) {
+        Write-Log "[COMPLIANT] Both registry values were already correctly configured."
+        Write-Log "No changes required. Device is protected against CVE-2013-3900."
+    } else {
+        Write-Log "[SUCCESS] Remediation applied: $changesApplied of $changesNeeded value(s) set."
+        Write-Log "[COMPLIANT] Certificate Padding Check is now active on this device."
+        Write-Log "Windows will now reject Authenticode-signed binaries with extraneous"
+        Write-Log "padding data — protecting against CVE-2013-3900 exploit attempts."
+        Write-Log "NOTE: No reboot required. Change is effective immediately."
+    }
+    Write-Log "================================================"
+    exit 0
+} else {
+    Write-Log "[FAILED] One or more registry values could not be set." "ERROR"
+    Write-Log "This device may still be vulnerable to CVE-2013-3900." "ERROR"
+    Write-Log "Review the output above and check registry permissions." "ERROR"
+    Write-Log "================================================"
+    exit 1
+}
